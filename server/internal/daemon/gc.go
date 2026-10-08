@@ -86,7 +86,11 @@ type gcStats struct {
 func (d *Daemon) runGC(ctx context.Context) {
 	stats := &gcStats{byPattern: map[string]int{}}
 	for _, gr := range d.gcWorkspaceRoots() {
+		before := stats.bytesReclaimed
 		d.gcRoot(ctx, gr.root, stats)
+		if gr.profile != d.cfg.Profile && stats.bytesReclaimed > before {
+			d.logger.Info("gc: reclaimed profile root", "profile", gr.profile, "root", gr.root, "bytes_reclaimed", stats.bytesReclaimed-before)
+		}
 	}
 
 	// Stable-root records are published before the physical env root so a
@@ -96,7 +100,8 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// period and an authoritative terminal/not-found task check. This stays on
 	// the current profile's root: root-index records are the current daemon's
 	// own dispatch bookkeeping, and reclaimed profile roots are handled by the
-	// per-root gcRoot walk above instead.
+	// per-root gcRoot walk above instead. Unpublished records in foreign roots
+	// are deliberately retained; this daemon does not own their dispatch index.
 	rootRecordsRemoved, rootRecordsErr := execenv.PruneTaskRootIndex(d.cfg.WorkspacesRoot, d.cfg.GCOrphanTTL, time.Now(), func(_ string, taskID string) bool {
 		if ctx.Err() != nil || d.client == nil {
 			return false
@@ -170,56 +175,33 @@ func (d *Daemon) runGC(ctx context.Context) {
 	}
 }
 
-// gcRoot identifies a single workspace root to scan during a GC pass.
-type gcRoot struct {
+// gcTarget identifies a single workspace root to scan during a GC pass.
+type gcTarget struct {
 	profile string
 	root    string
 }
 
-// gcWorkspaceRoots returns the workspace roots a single GC pass should walk:
-// the current profile's root plus every root left behind by a previous profile
-// whose daemon is no longer running. Roots owned by a live daemon are skipped
-// because isActiveEnvRoot is in-process memory: a daemon sweeping another
-// profile's root would not see that profile's live tasks and would delete
-// workdirs a different daemon is actively using (see #6962).
-func (d *Daemon) gcWorkspaceRoots() []gcRoot {
-	roots := []gcRoot{{profile: d.cfg.Profile, root: d.cfg.WorkspacesRoot}}
-
-	profilesDir, err := cli.ProfileDir("")
+// gcWorkspaceRoots shares enumeration with disk usage. PID probes only avoid
+// unnecessary work; task and repository locks provide mutation safety even
+// when a daemon starts after enumeration or its PID file is missing.
+func (d *Daemon) gcWorkspaceRoots() []gcTarget {
+	roots := []gcTarget{{profile: d.cfg.Profile, root: d.cfg.WorkspacesRoot}}
+	seen := []DiskUsageRoot{{Profile: d.cfg.Profile, Root: d.cfg.WorkspacesRoot}}
+	candidates, err := EnumerateWorkspaceRoots()
 	if err != nil {
+		d.logger.Warn("gc: enumerate workspace roots failed", "error", err)
 		return roots
 	}
-	profilesDir = filepath.Join(profilesDir, "profiles")
-	entries, err := os.ReadDir(profilesDir)
-	if err != nil {
-		// No profiles directory: there are no other roots to scan.
-		return roots
+	for _, candidate := range candidates {
+		if candidate.Profile == d.cfg.Profile || containsWorkspaceRoot(seen, candidate.Root) || d.profileDaemonActive(candidate.Profile) {
+			continue
+		}
+		if info, err := os.Stat(candidate.Root); err != nil || !info.IsDir() {
+			continue
+		}
+		roots = append(roots, gcTarget{profile: candidate.Profile, root: candidate.Root})
+		seen = append(seen, candidate)
 	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		profile := entry.Name()
-		if profile == d.cfg.Profile {
-			continue
-		}
-		// Another daemon's active task set only exists in that daemon's
-		// process. Even though this daemon can see the root on disk, sweeping
-		// it would bypass isActiveEnvRoot and could delete in-flight workdirs.
-		if d.profileDaemonActive(profile) {
-			continue
-		}
-		root, err := ResolveWorkspacesRoot(profile, "")
-		if err != nil {
-			continue
-		}
-		if info, statErr := os.Stat(root); statErr != nil || !info.IsDir() {
-			continue
-		}
-		roots = append(roots, gcRoot{profile: profile, root: root})
-	}
-
 	return roots
 }
 
@@ -253,7 +235,7 @@ func (d *Daemon) gcRoot(ctx context.Context, root string, stats *gcStats) {
 		if os.IsNotExist(err) {
 			return
 		}
-		d.logger.Warn("gc: read workspaces root failed", "error", err)
+		d.logger.Warn("gc: read workspaces root failed", "root", root, "error", err)
 		return
 	}
 
@@ -292,7 +274,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, root, wsDir string, stats *gcS
 		if ctx.Err() != nil {
 			return
 		}
-		if !entry.IsDir() {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		taskDir := filepath.Join(wsDir, entry.Name())
@@ -391,13 +373,13 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, root, workspaceID string
 			// data stays. The regenerable Codex cache is still fair game —
 			// see applyManagedArtifactFallback.
 			action := d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, gcActionSkip)
-			cleaned += d.applyGCAction(root, candidate.taskDir, action, stats)
+			cleaned += d.applyGCActionForMeta(root, candidate.taskDir, action, stats, candidate.meta)
 			continue
 		}
 		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
 		action = d.applyManagedArtifactFallback(candidate.taskDir, candidate.meta, action)
-		cleaned += d.applyGCAction(root, candidate.taskDir, action, stats)
+		cleaned += d.applyGCActionForMeta(root, candidate.taskDir, action, stats, candidate.meta)
 	}
 	return cleaned
 }
@@ -406,6 +388,54 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, root, workspaceID string
 // atomically reserves the env root because a task can start while the server
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(root, taskDir string, action gcAction, stats *gcStats) int {
+	return d.applyGCActionForMeta(root, taskDir, action, stats, nil)
+}
+
+func (d *Daemon) applyGCActionForMeta(root, taskDir string, action gcAction, stats *gcStats, expected *execenv.GCMeta) int {
+	if action == gcActionSkip {
+		stats.skipped++
+		return 0
+	}
+	if _, err := d.gcTaskDirOwner(root, taskDir); err != nil {
+		d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)
+		stats.skipped++
+		return 0
+	}
+	removed := 0
+	ran, err := execenv.WithEnvRootGCLock(taskDir, func(releaseTaskLock func()) error {
+		// A re-dispatch may have both started and finished during the batch
+		// request. Its released lock is not permission to apply the old TTL.
+		if expected != nil {
+			current, err := execenv.ReadGCMeta(taskDir)
+			if err != nil {
+				stats.skipped++
+				return nil
+			}
+			previous := *expected
+			// Compare persisted time, not time.Time's monotonic clock/location.
+			current.CompletedAt = current.CompletedAt.UTC()
+			previous.CompletedAt = previous.CompletedAt.UTC()
+			if previous.Kind == "" {
+				previous.Kind = execenv.GCKindIssue
+			}
+			if *current != previous {
+				stats.skipped++
+				return nil
+			}
+		}
+		removed = d.applyGCActionLocked(root, taskDir, action, stats, releaseTaskLock)
+		return nil
+	})
+	if !ran {
+		stats.skipped++
+	}
+	if err != nil {
+		d.logger.Warn("gc: task lock failed", "dir", taskDir, "error", err)
+	}
+	return removed
+}
+
+func (d *Daemon) applyGCActionLocked(root, taskDir string, action gcAction, stats *gcStats, releaseTaskLock func()) int {
 	if action != gcActionSkip {
 		if _, err := d.gcTaskDirOwner(root, taskDir); err != nil {
 			d.logger.Warn("gc: refusing to mutate unowned task directory", "dir", taskDir, "error", err)
@@ -428,7 +458,7 @@ func (d *Daemon) applyGCAction(root, taskDir string, action gcAction, stats *gcS
 	}
 	switch action {
 	case gcActionClean:
-		bytes, removed := d.cleanTaskDir(root, taskDir)
+		bytes, removed := d.cleanTaskDirLocked(root, taskDir, releaseTaskLock)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -437,7 +467,7 @@ func (d *Daemon) applyGCAction(root, taskDir string, action gcAction, stats *gcS
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
-		bytes, removed := d.cleanTaskDir(root, taskDir)
+		bytes, removed := d.cleanTaskDirLocked(root, taskDir, releaseTaskLock)
 		if !removed {
 			stats.skipped++
 			return 0
@@ -958,6 +988,20 @@ func (d *Daemon) gcTaskDirOwner(root, taskDir string) (*execenv.EnvRootOwner, er
 // reclaimed bytes, and returns that count for the cycle summary. A failed or
 // refused removal reports removed=false.
 func (d *Daemon) cleanTaskDir(root, taskDir string) (bytes int64, removed bool) {
+	if _, err := d.gcTaskDirOwner(root, taskDir); err != nil {
+		return 0, false
+	}
+	_, err := execenv.WithEnvRootGCLock(taskDir, func(releaseTaskLock func()) error {
+		bytes, removed = d.cleanTaskDirLocked(root, taskDir, releaseTaskLock)
+		return nil
+	})
+	if err != nil {
+		d.logger.Warn("gc: task lock failed", "dir", taskDir, "error", err)
+	}
+	return
+}
+
+func (d *Daemon) cleanTaskDirLocked(root, taskDir string, releaseTaskLock func()) (bytes int64, removed bool) {
 	// Measure first, prove ownership second. dirSize walks the entire tree,
 	// which on a large task directory takes long enough for the validated
 	// directory to be replaced underneath us — checking before that walk would
@@ -969,6 +1013,9 @@ func (d *Daemon) cleanTaskDir(root, taskDir string) (bytes int64, removed bool) 
 		d.logger.Warn("gc: refusing to remove unowned task directory", "dir", taskDir, "error", ownerErr)
 		return 0, false
 	}
+	// Startup still holds off on the persistent sidecar gate while the
+	// in-directory handle is closed for Windows directory removal.
+	releaseTaskLock()
 	if err := os.RemoveAll(taskDir); err != nil {
 		d.logger.Warn("gc: remove task dir failed", "dir", taskDir, "error", err)
 		return 0, false
@@ -1291,7 +1338,14 @@ func (d *Daemon) withRepoMaintenance(ctx context.Context, barePath string, fn fu
 		}
 		return
 	}
-	d.withRepoLock(barePath, func() { fn(ctx) })
+	d.withRepoLock(barePath, func() {
+		// Even a degraded/test backend must coordinate with foreign daemons.
+		cache := repocache.New(filepath.Dir(barePath), d.logger)
+		_, err := cache.WithRepoMaintenance(ctx, barePath, func(lockCtx context.Context) error { fn(lockCtx); return nil })
+		if err != nil {
+			d.logger.Warn("gc: repo maintenance lock failed", "repo", barePath, "error", err)
+		}
+	})
 }
 
 // withRepoLock serializes a mutation against Sync / CreateWorktree on the same

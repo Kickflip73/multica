@@ -164,9 +164,7 @@ func TestRunGCReclaimsAbandonedProfileRoot(t *testing.T) {
 	}
 	abandonedRoot := filepath.Join(home, "multica_workspaces_"+abandoned)
 
-	// 孤儿 task 目录：无 .gc_meta.json，mtime 73 小时前。它仍带有有效的
-	// .task_owner 标记（真实崩溃会留下该标记），因此所有权校验通过，仅由
-	// mtime 决定是否清理。
+	// A crashed execution leaves an owned orphan older than the retention TTL.
 	orphanTask := createTaskDir(t, abandonedRoot, "ws-abc", "task-orphan", nil)
 	if err := os.WriteFile(filepath.Join(orphanTask, "leftover.txt"), []byte("orphan"), 0o644); err != nil {
 		t.Fatal(err)
@@ -176,7 +174,7 @@ func TestRunGCReclaimsAbandonedProfileRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 活跃 task 目录：mtime 较新，不应被删除。
+	// A recently written task must survive the sweep.
 	activeTask := createTaskDir(t, abandonedRoot, "ws-abc", "task-active", nil)
 	if err := os.WriteFile(filepath.Join(activeTask, "recent.txt"), []byte("active"), 0o644); err != nil {
 		t.Fatal(err)

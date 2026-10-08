@@ -688,6 +688,7 @@ func TestCleanTaskDir_RemovesStableRootRecord(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 	original := env.RootDir
+	env.ReleaseLock() // GC may only reclaim an execution after it has ended.
 	d := &Daemon{cfg: Config{WorkspacesRoot: root}, logger: slog.Default()}
 	if bytes, removed := d.cleanTaskDir(d.cfg.WorkspacesRoot, original); !removed || bytes <= 0 {
 		t.Fatalf("reclaimed bytes = %d, want owner metadata bytes", bytes)

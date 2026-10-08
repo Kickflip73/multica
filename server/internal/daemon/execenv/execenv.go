@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/multica-ai/multica/server/internal/daemon/filelock"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1426,6 +1427,11 @@ const envRootLockFile = ".task_lock"
 // Holding the lock also serialises everything below it, which is what makes
 // repairing a torn marker safe: no other execution can be mid-claim.
 func claimEnvRoot(envRoot, workspaceID, taskID string) (lockFile *os.File, reset bool, err error) {
+	gate, err := lockRootMutation(envRoot)
+	if err != nil {
+		return nil, false, err
+	}
+	defer filelock.Release(gate)
 	if err := os.MkdirAll(envRoot, 0o755); err != nil {
 		return nil, false, fmt.Errorf("create env root %s: %w", envRoot, err)
 	}
