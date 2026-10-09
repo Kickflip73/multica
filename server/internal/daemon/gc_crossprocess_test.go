@@ -164,3 +164,51 @@ func TestGCForeignRepoLockPreventsEviction(t *testing.T) {
 		t.Fatalf("unlocked idle repo not reclaimed: %+v", stats)
 	}
 }
+
+// Legacy metadata has no workspace ID and therefore uses the single-issue
+// endpoint instead of the batch path. A completed rerun must survive there too.
+func TestGCForeignRootCompletedAgainDuringLegacyIssueCheck(t *testing.T) {
+	foreign := t.TempDir()
+	params := execenv.RootDirParams{WorkspacesRoot: foreign, WorkspaceID: "ws-race", TaskID: "task-race"}
+	claim, err := execenv.ClaimEnvRoot(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.Release()
+	root, err := execenv.ResolveRootDir(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := execenv.GCMeta{Kind: execenv.GCKindIssue, IssueID: "issue-race", CompletedAt: time.Now().Add(-10 * 24 * time.Hour)}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gc_meta.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(root, "rerun-output")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/issues/issue-race/gc-check", func(w http.ResponseWriter, r *http.Request) {
+		claim, err := execenv.ClaimEnvRoot(params)
+		if err != nil {
+			t.Error(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer claim.Release()
+		if err := os.WriteFile(payload, []byte("new execution output"), 0o644); err != nil {
+			t.Error(err)
+		}
+		if err := execenv.WriteGCMeta(root, meta, slog.Default()); err != nil {
+			t.Error(err)
+		}
+		claim.Release()
+		json.NewEncoder(w).Encode(map[string]any{"status": "done", "updated_at": time.Now().Add(-10 * 24 * time.Hour)})
+	})
+	d := newGCTestDaemon(t, mux)
+	d.gcRoot(context.Background(), foreign, &gcStats{byPattern: map[string]int{}})
+	if _, err := os.Stat(payload); err != nil {
+		t.Fatalf("GC deleted the completed foreign rerun: %v", err)
+	}
+}
