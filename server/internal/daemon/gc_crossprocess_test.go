@@ -212,3 +212,43 @@ func TestGCForeignRootCompletedAgainDuringLegacyIssueCheck(t *testing.T) {
 		t.Fatalf("GC deleted the completed foreign rerun: %v", err)
 	}
 }
+
+func TestGCForeignRootArtifactProtection(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		name := "active"
+		if cancelled {
+			name = "cancelled"
+		}
+		t.Run(name, func(t *testing.T) {
+			d := newGCTestDaemon(t, http.NewServeMux())
+			foreign := t.TempDir()
+			meta := &execenv.GCMeta{Kind: execenv.GCKindIssue, WorkspaceID: "ws", IssueID: "issue", CompletedAt: time.Now().Add(-24 * time.Hour)}
+			taskDir := createTaskDir(t, foreign, "ws", "task", meta)
+			repo := filepath.Join(taskDir, "workdir", "repo")
+			tracked := filepath.Join(repo, ".next", "output")
+			cache := filepath.Join(repo, "node_modules", "cache")
+			writeFile(t, tracked, 16)
+			writeFile(t, cache, 8)
+			runGitForGC(t, repo, "init")
+			runGitForGC(t, repo, "add", ".next/output")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if cancelled {
+				cancel()
+			}
+			stats := &gcStats{byPattern: map[string]int{}}
+			d.applyGCActionForMeta(ctx, foreign, taskDir, gcActionCleanArtifacts, stats, meta)
+			if _, err := os.Stat(tracked); err != nil {
+				t.Fatalf("tracked output must survive foreign-root GC: %v", err)
+			}
+			_, err := os.Stat(cache)
+			if cancelled {
+				if err != nil || stats.artifactRemoved != 0 {
+					t.Fatalf("cancelled cleanup mutated cache: err=%v stats=%+v", err, stats)
+				}
+			} else if !os.IsNotExist(err) || stats.artifactRemoved != 1 {
+				t.Fatalf("untracked cache was not reclaimed: err=%v stats=%+v", err, stats)
+			}
+		})
+	}
+}
